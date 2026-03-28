@@ -1,9 +1,8 @@
 import threading
 from typing import NamedTuple
 
-from sklearn.pipeline import Pipeline
-
 from ml_service.mlflow_utils import load_model
+from sklearn.pipeline import Pipeline
 
 
 class ModelData(NamedTuple):
@@ -25,7 +24,10 @@ class Model:
             return self.data
 
     def set(self, run_id: str) -> None:
-        model = load_model(run_id=run_id)
+        try:
+            model = load_model(run_id=run_id)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model with run_id {run_id}: {e}")
         with self.lock:
             self.data = ModelData(model=model, run_id=run_id)
 
