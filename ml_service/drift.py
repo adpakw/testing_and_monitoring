@@ -1,39 +1,88 @@
 import asyncio
-from collections import deque
+import importlib
+import logging
+import os
+from dataclasses import dataclass, field
 
-import mlflow
 import pandas as pd
-from evidently import Report
-from evidently.presets import DataDriftPreset
-from evidently.ui.workspace import RemoteWorkspace
 
-EVIDENTLY_URL = "http://158.160.2.37:8000/"
-PROJECT_ID = "019d061f-cc08-7b5e-b932-d792a1f258e2"
-REFERENCE_SIZE = 1000
-DRIFT_CHECK_SIZE = 500
+LOGGER = logging.getLogger(__name__)
 
 
-class DriftCollector:
-    def __init__(self):
-        self.buffer = deque(maxlen=DRIFT_CHECK_SIZE)
-        self.reference_data = None
-        self.lock = asyncio.Lock()
+@dataclass
+class DriftBuffer:
+    reference: pd.DataFrame | None = None
+    current_chunk: list[dict[str, object]] = field(default_factory=list)
 
-    async def collect(self, features: dict, prediction: int, probability: float):
-        record = {**features, "prediction": prediction, "probability": probability}
-        async with self.lock:
-            self.buffer.append(record)
-            if len(self.buffer) >= DRIFT_CHECK_SIZE and self.reference_data is not None:
-                await self._send_report()
+    def add(self, row: dict[str, object]) -> None:
+        self.current_chunk.append(row)
 
-    async def set_reference(self, reference_df: pd.DataFrame):
-        self.reference_data = reference_df
+    def flush_current(self) -> pd.DataFrame:
+        frame = pd.DataFrame(self.current_chunk)
+        self.current_chunk = []
+        return frame
 
-    async def _send_report(self):
-        async with self.lock:
-            current_df = pd.DataFrame(list(self.buffer))
-            self.buffer.clear()
-        report = Report(metrics=[DataDriftPreset()])
-        report.run(reference_data=self.reference_data, current_data=current_df)
-        workspace = RemoteWorkspace(EVIDENTLY_URL)
-        workspace.add_run(PROJECT_ID, report)
+
+DRIFT_BUFFER = DriftBuffer()
+
+
+def drift_enabled() -> bool:
+    return bool(os.getenv("EVIDENTLY_URL") and os.getenv("EVIDENTLY_PROJECT_ID"))
+
+
+def track_for_drift(
+    feature_values: dict[str, object], prediction: int, probability: float
+) -> None:
+    DRIFT_BUFFER.add(
+        {
+            **feature_values,
+            "prediction": prediction,
+            "probability": probability,
+        }
+    )
+
+
+async def run_drift_reporter() -> None:
+    if not drift_enabled():
+        LOGGER.info("Evidently reporting disabled")
+        return
+
+    try:
+        evidently_module = importlib.import_module("evidently")
+        presets_module = importlib.import_module("evidently.presets")
+        workspace_module = importlib.import_module("evidently.ui.workspace")
+        report_cls = evidently_module.Report
+        drift_preset_cls = presets_module.DataDriftPreset
+        remote_workspace_cls = workspace_module.RemoteWorkspace
+    except ImportError:
+        LOGGER.warning("Evidently package not installed")
+        return
+
+    interval_seconds = int(os.getenv("DRIFT_INTERVAL_SECONDS", "300"))
+    min_samples = int(os.getenv("DRIFT_MIN_SAMPLES", "100"))
+    evidently_url = os.getenv("EVIDENTLY_URL")
+    project_id = os.getenv("EVIDENTLY_PROJECT_ID")
+    workspace = remote_workspace_cls(evidently_url)
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+
+        if len(DRIFT_BUFFER.current_chunk) < min_samples:
+            continue
+
+        current_data = DRIFT_BUFFER.flush_current()
+        if DRIFT_BUFFER.reference is None:
+            DRIFT_BUFFER.reference = current_data.copy()
+            LOGGER.info("Initialized drift reference data")
+            continue
+
+        try:
+            drift_report = report_cls(metrics=[drift_preset_cls()])
+            result = drift_report.run(
+                reference_data=DRIFT_BUFFER.reference,
+                current_data=current_data,
+            )
+            workspace.add_run(project_id, result)
+            LOGGER.info("Uploaded drift report")
+        except Exception:
+            LOGGER.exception("Failed to build/upload drift report")
